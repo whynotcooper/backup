@@ -14,6 +14,11 @@ class ArchiveMetadataTest {
     @TempDir Path temp;
     private static final long OLD = 1_600_000_000_000L;
 
+    private static void assumeFileIdentityAvailable(Path sample) throws java.io.IOException {
+        assumeTrue(Files.readAttributes(sample, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).fileKey() != null,
+                "File identity (fileKey) unavailable on this platform; hardlink detection is POSIX-only");
+    }
+
     @Test void accessTimeOnlyChangeIsRestoredWithoutRearchivingUnchangedContent() throws Exception {
         Path source = Files.createDirectory(temp.resolve("source"));
         Path file = Files.writeString(source.resolve("file"), "unchanged");
@@ -147,6 +152,7 @@ class ArchiveMetadataTest {
         Path source = Files.createDirectory(temp.resolve("source"));
         Path first = Files.writeString(source.resolve("a"), "original");
         Files.createLink(source.resolve("b"), first);
+        assumeFileIdentityAvailable(first);
         BackupService service = new BackupService();
         BackupOptions options = options(source, true);
         BackupResult full = service.backup(options);

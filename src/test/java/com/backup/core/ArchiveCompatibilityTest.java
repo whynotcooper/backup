@@ -6,14 +6,21 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.zip.*;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /** Fixtures deliberately do not use the current archive or manifest writers. */
 class ArchiveCompatibilityTest {
     @TempDir Path temp;
     private static final byte[] CONTENT = "legacy fixture\n".getBytes(StandardCharsets.UTF_8);
     private static final long MODIFIED = 1_600_000_000_000L;
+
+    private static void assumeFileIdentityAvailable(Path sample) throws IOException {
+        assumeTrue(Files.readAttributes(sample, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).fileKey() != null,
+                "File identity (fileKey) unavailable on this platform; hardlink detection is POSIX-only");
+    }
 
     private String manifest(String compression, String path) {
         return "version=1\nsourceRoot=/old/source\ncreatedAt=2020-09-13T12:26:40Z\n"
@@ -106,6 +113,7 @@ class ArchiveCompatibilityTest {
         Path source = Files.createDirectory(temp.resolve("source"));
         Files.writeString(source.resolve("a"), "linked data");
         Files.createLink(source.resolve("hard"), source.resolve("a"));
+        assumeFileIdentityAvailable(source.resolve("a"));
         Files.createSymbolicLink(source.resolve("relative"), Path.of("a"));
         Files.createSymbolicLink(source.resolve("broken"), Path.of("missing"));
         char[] password = "fixture-password".toCharArray();

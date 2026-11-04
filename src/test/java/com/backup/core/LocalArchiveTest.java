@@ -7,14 +7,22 @@ import java.nio.file.attribute.*;
 import java.io.IOException;
 import java.util.zip.*;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class LocalArchiveTest {
     @TempDir Path temp;
+
+    /** Hardlink fidelity requires per-file identity; Windows reports a null fileKey. */
+    private static void assumeFileIdentityAvailable(Path sample) throws IOException {
+        assumeTrue(Files.readAttributes(sample, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).fileKey() != null,
+                "File identity (fileKey) unavailable on this platform; hardlink detection is POSIX-only");
+    }
 
     @Test void missingHardlinkBaseDoesNotDeleteExistingTargetFile() throws Exception {
         Path source = Files.createDirectory(temp.resolve("source"));
         Files.writeString(source.resolve("a"), "data");
         Files.createLink(source.resolve("b"), source.resolve("a"));
+        assumeFileIdentityAvailable(source.resolve("a"));
         java.util.List<BackupEntry> entries = new FileScanner().scan(source);
         BackupManifest manifest = new BackupManifest(source.toString(), java.time.Instant.now(), CompressionType.ZIP, true, false, entries);
         Path archive = temp.resolve("increment.zip");
@@ -64,6 +72,7 @@ class LocalArchiveTest {
         Path source = Files.createDirectory(temp.resolve("source"));
         Files.writeString(source.resolve("first"), "shared");
         Files.createLink(source.resolve("second"), source.resolve("first"));
+        assumeFileIdentityAvailable(source.resolve("first"));
         Path out = temp.resolve("out");
         new BackupService().restore(backup(source, CompressionType.GZIP).archivePath(), out, null);
         assertTrue(Files.isSameFile(out.resolve("first"), out.resolve("second")));

@@ -7,11 +7,15 @@ import java.nio.file.*;
 import java.nio.file.attribute.*;
 import java.util.*;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class LocalBackupServiceTest {
     @TempDir Path temp;
     private BackupOptions options(Path source, String name, boolean incremental, int keep, BackupFilter filter) {
         return new BackupOptions(source, temp.resolve("backups"), name, CompressionType.ZIP, incremental, false, null, filter, keep);
+    }
+    private void posix(Path path) {
+        assumeTrue(Files.getFileAttributeView(path, PosixFileAttributeView.class) != null, "POSIX attributes unavailable");
     }
 
     @Test void filtersBeforeChoosingHardlinkPayloadAndKeepsAncestors() throws Exception {
@@ -72,6 +76,7 @@ class LocalBackupServiceTest {
 
     @Test void metadataOnlyChangesAreIncludedInIncremental() throws Exception {
         Path source = Files.createDirectory(temp.resolve("source")); Path file = Files.writeString(source.resolve("file"), "same");
+        posix(file);
         BackupService service = new BackupService(); BackupOptions options = options(source, "chain", true, 0, BackupFilter.all());
         service.backup(options);
         Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"));
@@ -81,6 +86,23 @@ class LocalBackupServiceTest {
         Path out = temp.resolve("out"); service.restore(second.archivePath(), out, null);
         assertEquals(1_600_000_000_000L, Files.getLastModifiedTime(out.resolve("file")).toMillis());
         assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(out.resolve("file"))));
+    }
+
+    @Test void ownerFilterSelectsOnlyEntriesOfMatchingOwners() throws Exception {
+        Path source = Files.createDirectory(temp.resolve("source"));
+        Files.writeString(source.resolve("keep.txt"), "k");
+        Files.writeString(source.resolve("skip.pdf"), "s");
+        java.util.List<BackupEntry> unfiltered = new FileScanner().scan(source);
+        String owner = unfiltered.getFirst().owner();
+        assumeTrue(!owner.isBlank(), "Owner information unavailable on this platform");
+        BackupFilter byOwner = new BackupFilter("", "", "", false, "", owner, null, null, null, null);
+        assertEquals(2, new FileScanner().scan(source, byOwner, ignored -> {}).size());
+        BackupFilter ownerAndExtension = new BackupFilter("", "", "txt", false, "", owner, null, null, null, null);
+        java.util.List<BackupEntry> narrowed = new FileScanner().scan(source, ownerAndExtension, ignored -> {});
+        assertEquals(1, narrowed.size());
+        assertEquals("keep.txt", narrowed.getFirst().relativePath());
+        BackupFilter wrongOwner = new BackupFilter("", "", "", false, "", "no-such-owner-zz9x", null, null, null, null);
+        assertTrue(new FileScanner().scan(source, wrongOwner, ignored -> {}).isEmpty());
     }
 
     @Test void sourceAliasCannotPlaceDestinationInsideSource() throws Exception {

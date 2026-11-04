@@ -73,6 +73,7 @@ public final class ArchiveService {
     private RestoreResult restoreZip(Path archive, Path root) throws IOException {
         BackupManifest manifest;
         List<BackupEntry> restored = new ArrayList<>(); Set<String> seen = new HashSet<>();
+        List<String> warnings = new ArrayList<>();
         try (ZipInputStream in = new ZipInputStream(new BufferedInputStream(Files.newInputStream(archive)))) {
             ZipEntry first = in.getNextEntry();
             if (first == null || !BackupManifest.ARCHIVE_ENTRY_NAME.equals(first.getName())) throw new IOException("Archive must start with a Backup manifest");
@@ -85,16 +86,17 @@ public final class ArchiveService {
                 if (path.endsWith("/")) path = path.substring(0, path.length() - 1);
                 BackupEntry entry = requireEntry(byPath, seen, path);
                 if (zip.isDirectory() != entry.directory()) throw new IOException("Entry type mismatch: " + path);
-                restorePayload(root, entry, in, entry.type() == EntryType.FILE ? entry.size() : 0);
+                restorePayload(root, entry, in, entry.type() == EntryType.FILE ? entry.size() : 0, warnings);
                 if (in.read() != -1) throw new IOException("Unexpected extra entry data: " + path);
                 restored.add(entry); in.closeEntry();
             }
         }
-        return finish(root, manifest, restored);
+        return finish(root, manifest, restored, warnings);
     }
 
     private RestoreResult restoreGzip(Path archive, Path root) throws IOException {
         BackupManifest manifest; List<BackupEntry> restored = new ArrayList<>(); Set<String> seen = new HashSet<>();
+        List<String> warnings = new ArrayList<>();
         try (DataInputStream in = new DataInputStream(new BufferedInputStream(new GZIPInputStream(Files.newInputStream(archive))))) {
             String magic = readString(in);
             if (!GZIP_MAGIC.equals(magic) && !"BACKPACK-GZIP-1".equals(magic)) throw new IOException("Unsupported Backup GZIP archive");
@@ -108,11 +110,11 @@ public final class ArchiveService {
                 boolean directory = in.readBoolean(); long size = in.readLong(); in.readLong();
                 long expected = entry.type() == EntryType.FILE ? entry.size() : 0;
                 if (directory != entry.directory() || size != expected) throw new IOException("Entry metadata mismatch: " + entry.relativePath());
-                restorePayload(root, entry, in, size); restored.add(entry);
+                restorePayload(root, entry, in, size, warnings); restored.add(entry);
             }
             if (in.read() != -1) throw new IOException("Unexpected trailing archive data");
         }
-        return finish(root, manifest, restored);
+        return finish(root, manifest, restored, warnings);
     }
 
     private Map<String, BackupEntry> validateManifest(Path root, BackupManifest manifest) throws IOException {
@@ -121,6 +123,11 @@ public final class ArchiveService {
             safeResolve(root, entry.relativePath());
             if (result.put(entry.relativePath(), entry) != null) throw new IOException("Duplicate manifest path: " + entry.relativePath());
             if ((entry.type() == EntryType.HARD_LINK || entry.type() == EntryType.SYMBOLIC_LINK) && entry.linkTarget().isEmpty()) throw new IOException("Missing link target");
+            if (entry.type() == EntryType.CHARACTER_DEVICE || entry.type() == EntryType.BLOCK_DEVICE) {
+                if (!entry.linkTarget().matches("[0-9]{1,5}:[0-9]{1,5}")) throw new IOException("Invalid device number: " + entry.relativePath());
+            }
+            if ((entry.type() == EntryType.FIFO || entry.type() == EntryType.SOCKET) && !entry.linkTarget().isEmpty())
+                throw new IOException("Unexpected device number for " + entry.type() + ": " + entry.relativePath());
         }
         for (BackupEntry entry : result.values()) {
             Path parent = Path.of(entry.relativePath()).getParent();
@@ -143,7 +150,7 @@ public final class ArchiveService {
         return entry;
     }
 
-    private void restorePayload(Path root, BackupEntry entry, InputStream in, long size) throws IOException {
+    private void restorePayload(Path root, BackupEntry entry, InputStream in, long size, List<String> warnings) throws IOException {
         Path out = safeResolve(root, entry.relativePath()); checkParents(root, out);
         if (entry.directory()) {
             if (Files.isSymbolicLink(out)) throw new IOException("Symbolic link in restore path: " + out);
@@ -158,10 +165,61 @@ public final class ArchiveService {
                 if (!entry.sha256().isEmpty() && !HashUtils.sha256(staged).equals(entry.sha256())) throw new IOException("Content checksum mismatch: " + entry.relativePath());
                 moveReplacing(staged, out);
             } finally { Files.deleteIfExists(staged); }
+        } else if (entry.type() != EntryType.SYMBOLIC_LINK && entry.type() != EntryType.HARD_LINK) {
+            // Link entries carry no payload here; they are recreated from the manifest afterwards.
+            restoreSpecialFile(root, entry, warnings);
         }
     }
 
-    private RestoreResult finish(Path root, BackupManifest manifest, List<BackupEntry> entries) throws IOException {
+    /** Recreates pipes and devices with platform tools when available; sockets are recorded only. */
+    private void restoreSpecialFile(Path root, BackupEntry entry, List<String> warnings) throws IOException {
+        Path out = safeResolve(root, entry.relativePath()); checkParents(root, out);
+        if (Files.isSymbolicLink(out)) throw new IOException("Refusing to overwrite symbolic link: " + out);
+        Files.createDirectories(out.getParent());
+        Path staged = Files.createTempFile(out.getParent(), ".backup-special-", ".tmp");
+        Files.delete(staged);
+        boolean created = false;
+        try {
+            created = createSpecialFile(entry, staged, warnings);
+            if (created) {
+                if (Files.exists(out, LinkOption.NOFOLLOW_LINKS)) Files.delete(out);
+                moveReplacing(staged, out);
+            } else if (!Files.exists(out, LinkOption.NOFOLLOW_LINKS)) {
+                warnings.add(entry.relativePath() + ": " + entry.type() + " was not recreated; the entry is recorded in the manifest");
+            }
+        } finally { Files.deleteIfExists(staged); }
+    }
+
+    private boolean createSpecialFile(BackupEntry entry, Path staged, List<String> warnings) {
+        try {
+            boolean created = switch (entry.type()) {
+                case FIFO -> runPlatformTool("mkfifo", staged.toString());
+                case CHARACTER_DEVICE -> runPlatformTool("mknod", staged.toString(), "c", devicePart(entry, 0), devicePart(entry, 1));
+                case BLOCK_DEVICE -> runPlatformTool("mknod", staged.toString(), "b", devicePart(entry, 0), devicePart(entry, 1));
+                case SOCKET -> false;
+                default -> false;
+            };
+            if (!created && entry.type() == EntryType.SOCKET)
+                warnings.add(entry.relativePath() + ": unix domain sockets cannot be recreated by a backup tool");
+            return created;
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            warnings.add(entry.relativePath() + ": could not recreate " + entry.type() + " (" + e.getMessage() + ")");
+            return false;
+        }
+    }
+
+    private static String devicePart(BackupEntry entry, int index) {
+        return entry.linkTarget().split(":", 2)[index];
+    }
+
+    private boolean runPlatformTool(String... command) throws IOException, InterruptedException {
+        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+        try (InputStream output = process.getInputStream()) { output.readAllBytes(); }
+        return process.waitFor() == 0;
+    }
+
+    private RestoreResult finish(Path root, BackupManifest manifest, List<BackupEntry> entries, List<String> warnings) throws IOException {
         if (!manifest.incremental() && entries.size() != manifest.entries().size()) {
             throw new IOException("Full archive is missing file or directory payload entries");
         }
@@ -184,7 +242,6 @@ public final class ArchiveService {
                 } finally { Files.deleteIfExists(staged); }
             }
         }
-        List<String> warnings = new ArrayList<>();
         List<BackupEntry> metadata = new ArrayList<>(entries);
         if (manifest.incremental()) {
             Set<String> restoredPaths = new HashSet<>();
@@ -210,7 +267,25 @@ public final class ArchiveService {
                 Path target = safeResolve(root, entry.linkTarget()); checkParents(root, target);
                 yield matchesFile(path, entry) && Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS) && Files.isSameFile(path, target);
             }
+            case FIFO, CHARACTER_DEVICE, BLOCK_DEVICE, SOCKET -> matchesSpecialType(path, entry.type());
         };
+    }
+
+    private boolean matchesSpecialType(Path path, EntryType expected) {
+        try {
+            Object value = Files.getAttribute(path, "unix:mode", LinkOption.NOFOLLOW_LINKS);
+            if (!(value instanceof Integer mode)) return false;
+            EntryType actual = switch (mode & 0170000) {
+                case 0010000 -> EntryType.FIFO;
+                case 0020000 -> EntryType.CHARACTER_DEVICE;
+                case 0060000 -> EntryType.BLOCK_DEVICE;
+                case 0140000 -> EntryType.SOCKET;
+                default -> null;
+            };
+            return actual == expected;
+        } catch (IOException | UnsupportedOperationException | IllegalArgumentException e) {
+            return false;
+        }
     }
 
     private boolean matchesFile(Path path, BackupEntry entry) throws IOException {
